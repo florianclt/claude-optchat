@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync, type Stats } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync, type Stats } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -30,9 +30,18 @@ export function listProfiles() {
 export function createProfile(name: string) {
   const dir = profilePath(name);
   if (existsSync(dir)) throw new Error(`Profile already exists: ${name}`);
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  saveConfig(dir, defaults);
-  atomicWrite(join(dir, 'AGENTS.md'), `# ${name}\n\nThis is the ${name} profile.\nAdd your personal instructions here.\n`);
+  mkdirSync(resolve(dir, '..'), { recursive: true, mode: 0o700 });
+  // Claim the directory exclusively, so a competing creator cannot have its
+  // profile overwritten or removed by this attempt's cleanup.
+  mkdirSync(dir, { mode: 0o700 });
+  try {
+    saveConfig(dir, defaults);
+    atomicWrite(join(dir, 'AGENTS.md'), `# ${name}\n\nThis is the ${name} profile.\nAdd your personal instructions here.\n`);
+  } catch (error) {
+    try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); }
+    catch { throw new Error(`Failed to create profile ${name}, and could not remove its incomplete directory: ${dir}`, { cause: error }); }
+    throw error;
+  }
 }
 export function saveConfig(dir: string, config: ProfileConfig) { atomicWrite(join(dir, 'config.json'), JSON.stringify(config, null, 2) + '\n'); }
 function modelChoice(value: unknown): value is ModelChoice {
