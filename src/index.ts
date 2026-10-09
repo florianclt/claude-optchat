@@ -415,7 +415,8 @@ export default function optchat(pi: ExtensionAPI) {
   });
   registerConnectedRenderer(pi);
   registerReportRenderer(pi);
-  for (const tool of memoryTools(() => required().memory)) pi.registerTool(tool);
+  const [zoom, date] = memoryTools(() => required().memory, id => required().children.transcript(id));
+  pi.registerTool(zoom); pi.registerTool(date);
   pi.registerTool({ ...searchTool(() => required().memory), defaultActive: false });
   // The tool and its prompt line change together, once per toggle, so the cached prefix is otherwise stable.
   // Synced on save too: a report turn started while idle reuses the tool set without before_agent_start.

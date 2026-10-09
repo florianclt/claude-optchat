@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
 import { getCurrentSystemMessage, type SystemMessage, type UserMessage } from '@earendil-works/pi-ai';
-import { CAP, cap, type Memory } from './memory.ts';
+import { CAP, cap, isView, type Memory } from './memory.ts';
 import { record } from './cache.ts';
 import { DEFAULT_SETTINGS } from './settings.ts';
 import { imageRef, isImage } from './images.ts';
@@ -124,6 +124,28 @@ function latestExchange(branch: readonly SessionEntry[]) {
   return latest;
 }
 
+/** Ends every subagent report, so the parent knows it can check the report against what the child did. */
+export const fullChat = (id: string) => `Full chat: zoom("${id}")`;
+export const withoutFullChat = (text: string) => text.replace(/\n\nFull chat: zoom\("[\w-]+"\)$/gm, '');
+const TASK = '\n</chat>\n\nYour task:\n';
+/** Tool calls and results in a run transcript keep their head and tail, so a page holds many steps. */
+const STEP = 1_000;
+/** A subagent's chat for zoom, as `kind|text` lines: its task without the memory view, replies, tool calls and results, and what it was told. */
+export function runTranscript(messages: readonly AgentMessage[]) {
+  const task = messages.find(message => message.role === 'user');
+  return messages.flatMap(message => {
+    if (message.role === 'user') {
+      // Only the task prompt holds the memory view (src/agents.ts): `${view}\n\nYour task:\n${task}`.
+      const text = textContent(message.content, false), at = text.indexOf(TASK);
+      return [`user|${message === task && isView(text) && at >= 0 ? text.slice(at + '\n</chat>\n\n'.length) : text}`];
+    }
+    if (message.role === 'toolResult') return [`echo|${cap(`${message.toolName}: ${textContent(message.content, false)}`, STEP)}`];
+    if (message.role !== 'assistant') return [];
+    return [...message.content.flatMap(block => block.type === 'text' && block.text.trim() ? [`talk|${block.text}`]
+      : block.type === 'toolCall' ? [`tool|${cap(`${block.name} ${JSON.stringify(block.arguments)}`, STEP)}`] : []),
+    ...message.stopReason === 'error' || message.stopReason === 'aborted' ? [`echo|Agent ${message.stopReason}: ${message.errorMessage ?? 'No further details'}`] : []];
+  }).join('\n');
+}
 /** Keep one completed exchange plus the current run; all other history comes from the view. */
 export function buildContext(canonical: AgentMessage[], run: AgentMessage[], view: string, prompt: string,
   previous: readonly AgentMessage[] = []): AgentMessage[] {
