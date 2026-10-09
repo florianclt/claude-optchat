@@ -481,9 +481,10 @@ async function busyChildren(dir: string, reports: string[], options: { settings?
       return stream;
     },
   });
-  const children = new Children(new Memory(join(dir, 'profile'), async input => input.source.slice(0, 100), () => {}), new ModelRegistry(runtime), () => ({ provider: 'optchat-test', model: 'child', thinking: 'minimal' }), () => '',
+  const memory = new Memory(join(dir, 'profile'), async input => input.source.slice(0, 100), () => {});
+  const children = new Children(memory, new ModelRegistry(runtime), () => ({ provider: 'optchat-test', model: 'child', thinking: 'minimal' }), () => '',
     async text => { reports.push(withoutFullChat(text)); options.onReport?.(text); }, () => {}, join(dir, 'profile'), { settings: options.settings ?? nested, createSession: options => createAgentSession({ ...options, modelRuntime: runtime }) });
-  return { children, asked };
+  return { children, asked, memory };
 }
 
 test('interrupting a child aborts its step and continues with the queued messages; with none queued it waits for the next one', async () => {
@@ -589,7 +590,8 @@ test('an interrupt right after taking a message back delivers each remaining mes
 test('deleting a running agent stops it and the agents it started, delivers its report, then removes their files for good', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'optchat-delete-'));
   const reports: string[] = [];
-  const { children, asked } = await busyChildren(dir, reports);
+  const { children, asked, memory } = await busyChildren(dir, reports);
+  const deleted = () => memory.root.filter(e => e.kind === 'work' && e.text.endsWith('deleted by the user')).map(e => e.text);
   try {
     const [boss, done] = await children.spawn([{ task: 'boss' }, { task: 'done' }], dir);
     const [worker] = await children.spawn([{ task: 'worker' }], dir, undefined, boss);
@@ -602,6 +604,7 @@ test('deleting a running agent stops it and the agents it started, delivers its 
     assert.deepEqual(reports, [`[${boss}] Deleted by the user while it was working. The user dropped this task on purpose: do not redo it or delegate it again unless they ask.`],
       'the report still reached the main agent, and says the task was dropped on purpose');
     assert.ok(!children.history.records.has(boss) && !children.history.records.has(worker));
+    assert.deepEqual(deleted(), [], 'its report says so: nothing more is logged');
     assert.ok(doomed.every(file => !existsSync(file)), 'metadata and transcripts are gone');
     await assert.rejects(children.tell(boss, 'Come back.'), /No running subagent/);
 
@@ -611,6 +614,18 @@ test('deleting a running agent stops it and the agents it started, delivers its 
     await children.remove(done);
     assert.ok(finished.every(file => !existsSync(file)));
     assert.equal(reports.length, 2, 'a finished run is deleted without another report');
+    assert.deepEqual(deleted(), [`[${done}] deleted by the user`], 'so memory hears of it right away, without a turn');
+
+    // A tell that is still resuming a finished run when it is deleted makes it live again, so its own report says so.
+    const [again] = await children.spawn([{ task: 'again' }], dir);
+    await until(() => asked.length === 4);
+    await children.stop(again);
+    await until(() => !children.active);
+    const resumed = children.tell(again, 'One more thing.');
+    await children.remove(again);
+    await resumed.catch(() => {});
+    assert.match(reports.at(-1) ?? '', new RegExp(`^\\[${again}\\] Deleted by the user while it was working`));
+    assert.deepEqual(deleted(), [`[${done}] deleted by the user`], 'not logged a second time');
     assert.equal(new RunHistory(join(dir, 'profile')).records.size, 0, 'nothing comes back at the next start');
   } finally { await children.close(); rmSync(dir, { recursive: true, force: true }); }
 });
