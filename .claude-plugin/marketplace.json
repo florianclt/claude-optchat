@@ -1,0 +1,7 @@
+{
+  "name": "claude-optchat",
+  "owner": { "name": "florianclt" },
+  "plugins": [
+    { "name": "optchat", "source": "./", "description": "OptChat memory for Claude Code: persistent profiles, a zoomable summary tree of every conversation, and conversation imports." }
+  ]
+}

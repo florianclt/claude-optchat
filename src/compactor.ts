@@ -1,85 +1,57 @@
-import { clampThinkingLevel, type Api, type AssistantMessage, type Message, type Model } from '@earendil-works/pi-ai';
-import type { ThinkingLevel } from '@earendil-works/pi-agent-core';
-import type { ModelRegistry } from '@earendil-works/pi-coding-agent';
+import { spawn } from 'node:child_process';
 import { COMPACT, compaction, IMPORT_GUIDANCE, tooLong } from './prompts.ts';
 import { bytes, NODE, type Compressor } from './memory.ts';
-import { cachePayload, splitView } from './cache.ts';
-import { DEFAULT_SETTINGS } from './settings.ts';
+import type { ModelChoice } from './profiles.ts';
+import { record } from './cache.ts';
 
-export interface ModelChoice { provider: string; model: string; thinking: ThinkingLevel }
-/** A level the model can't take would be sent as no level, which Sonnet 5.5 runs at high effort; Pi's own sessions clamp the same way. */
-export const reasoningFor = (model: Model<Api>, level: ThinkingLevel) => {
-  const thinking = clampThinkingLevel(model, level);
-  return thinking === 'off' ? undefined : thinking;
-};
-const WARM_MS = 4 * 60_000; // Anthropic's short cache lives 5 minutes from its last use.
+/** Claude Code's effort levels. Pi's `off` and `minimal` have no counterpart, so they ask for the least. */
+export const effortFor = (thinking: ModelChoice['thinking']) => thinking === 'off' || thinking === 'minimal' ? 'low' : thinking;
+/** Set in every Claude Code process OptChat starts, so its own hooks stay out of them. */
+export const CHILD = 'OPTCHAT_CHILD';
+const TIMEOUT_MS = 5 * 60_000;
 
-/** Parallel calls can't read a cache entry that isn't written yet, so one call primes a cold prefix and the rest wait until it answers.
- * Parallel compactions end their views at different messages, so a call also waits for a primer of a shorter prefix of its own view. */
-function primeFirst() {
-  const warm = new Map<string, number | Promise<void>>();
-  return async (prefix: string, signal: AbortSignal) => {
-    const priming = () => { for (const [k, state] of warm) if (typeof state !== 'number' && prefix.startsWith(k)) return state; };
-    for (let state = warm.get(prefix) ?? priming(); state !== undefined; state = warm.get(prefix) ?? priming()) {
-      if (typeof state === 'number') { if (Date.now() - state < WARM_MS) break; warm.delete(prefix); continue; }
-      // A cancelled waiter leaves at once instead of waiting for someone else's primer.
-      signal.throwIfAborted();
-      let wake = () => {};
-      const aborted = new Promise<void>(resolve => { wake = resolve; });
-      signal.addEventListener('abort', wake, { once: true });
-      await Promise.race([state, aborted]);
-      signal.removeEventListener('abort', wake);
-      signal.throwIfAborted();
-    }
-    let release = () => {};
-    const pending = warm.has(prefix) ? undefined : new Promise<void>(resolve => { release = resolve; });
-    if (pending) warm.set(prefix, pending);
-    return (ok: boolean) => {
-      if (ok) { for (const [k, at] of warm) if (typeof at === 'number' && Date.now() - at >= WARM_MS) warm.delete(k); warm.set(prefix, Date.now()); }
-      else if (warm.get(prefix) === pending) warm.delete(prefix);
-      release();
-    };
-  };
+export interface Reply { text: string; usage?: unknown; costUSD?: number }
+/** One single-turn request through the `claude` command, so summaries use the login Claude Code already has: no tools, no
+ * MCP servers, no settings, no CLAUDE.md or auto-memory, and nothing saved as a session. */
+export async function ask(choice: ModelChoice, system: string, prompt: string, signal: AbortSignal): Promise<Reply> {
+  signal.throwIfAborted();
+  const args = ['-p', '--model', choice.model, '--effort', effortFor(choice.thinking), '--system-prompt', system, '--tools', '',
+    '--strict-mcp-config', '--setting-sources', '', '--no-session-persistence', '--output-format', 'json'];
+  const env = { ...process.env, [CHILD]: '1', CLAUDE_CODE_DISABLE_CLAUDE_MDS: '1', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' };
+  const child = spawn(process.env.OPTCHAT_CLAUDE ?? 'claude', args, { env, stdio: ['pipe', 'pipe', 'pipe'], signal, timeout: TIMEOUT_MS, windowsHide: true });
+  let out = '', err = '';
+  child.stdout.on('data', data => { out += data; });
+  child.stderr.on('data', data => { err += data; });
+  child.stdin.on('error', () => {});
+  child.stdin.end(prompt);
+  const code = await new Promise<number | null>((resolve, reject) => { child.on('error', reject); child.on('close', resolve); });
+  let result: unknown;
+  try { result = JSON.parse(out); } catch { throw new Error(`claude exited ${code}: ${(err || out).trim().slice(0, 500) || 'no output'}`); }
+  if (!record(result) || result.is_error === true || typeof result.result !== 'string')
+    throw new Error(`claude: ${record(result) && typeof result.result === 'string' ? result.result : (err || out).trim().slice(0, 500)}`);
+  return { text: result.result, usage: result.usage, costUSD: typeof result.total_cost_usd === 'number' ? result.total_cost_usd : undefined };
 }
-/** The model is asked for 512 bytes; `accepted` is the longest line kept without a retry (the profile's summary size tolerance). */
-export function createCompressor(registry: ModelRegistry, choice: () => ModelChoice,
-  onUsage: (message: AssistantMessage) => void = () => {}, accepted = () => DEFAULT_SETTINGS.summaryAcceptBytes): Compressor {
-  const gate = primeFirst();
+
+/** The model is asked for 512 bytes; `accepted` is the longest line kept without a retry (the profile's summary size tolerance).
+ * Pi sent the "Too long" retry as a further turn of the same conversation; one `claude -p` call is one turn, so the retry
+ * repeats the request with the rejected line quoted before the recipe's retry text. */
+export function createCompressor(choice: () => ModelChoice, accepted: () => number, onReply: (reply: Reply) => void = () => {},
+  call = ask): Compressor {
   return async (input, signal) => {
-    const selected = choice();
-    const model = registry.find(selected.provider, selected.model);
-    if (!model) throw new Error(`Compactor model unavailable: ${selected.provider}/${selected.model}. Use /optchat model.`);
-    const thinking = reasoningFor(model, selected.thinking);
     const step = `${input.historical ? IMPORT_GUIDANCE + '\n\n' : ''}${compaction(input)}`;
-    const messages: Message[] = [{ role: 'user', content: [{ type: 'text', text: input.context }, { type: 'text', text: step }], timestamp: Date.now() }];
-    const view = splitView(input.context);
-    const prefix = model.api === 'anthropic-messages' && view.length > 1 ? `${model.provider}/${model.id}/${thinking ?? 'off'}\n${view.slice(0, -1).join('')}` : undefined;
-    const tries: string[] = [];
+    const request = `${input.context}\n\n${step}`, tries: string[] = [];
+    let prompt = request;
     for (let attempt = 0; attempt < 5; attempt++) {
-      const warmed = prefix ? await gate(prefix, signal) : () => {};
-      let reply: AssistantMessage;
-      try {
-        const stream = registry.streamSimple(model, { systemPrompt: COMPACT, messages }, {
-          // A shared session id is the OpenAI prompt-cache key; SSE because over a websocket Codex would chain unrelated parallel calls on one cached connection.
-          sessionId: 'optchat-compactor', transport: 'sse',
-          reasoning: thinking, signal, cacheRetention: 'short',
-          onPayload: payload => model.api === 'anthropic-messages' ? cachePayload(payload) : payload,
-        });
-        // The cache entry is usable once the model starts answering.
-        for await (const event of stream) if (event.type !== 'start') { warmed(event.type !== 'error'); break; }
-        reply = await stream.result();
-      } finally { warmed(false); }
-      onUsage(reply);
-      if (reply.stopReason === 'error' || reply.stopReason === 'aborted') throw new Error(reply.errorMessage ?? `Compactor ${reply.stopReason}`);
+      const reply = await call(choice(), COMPACT, prompt, signal);
+      onReply(reply);
       // The compactions' view shows each line under its id+n| head, which a line can copy.
-      const line = reply.content.filter(c => c.type === 'text').map(c => c.text).join('').trim().replace(/^\d+\+\d+\|\s*/, '');
+      const line = reply.text.trim().replace(/^\d+\+\d+\|\s*/, '');
       if (!line) throw new Error('Compactor returned no text.');
       tries.push(line);
       // A merge of two short lines can come back nearly as big as both, so a line must also shrink what it replaces.
       if (bytes(line) <= accepted() && bytes(line) < bytes(input.source)) break;
-      messages.push(reply);
-      const cut = Buffer.from(line).subarray(0, NODE).toString('utf8').replace(/\uFFFD$/, '');
-      messages.push({ role: 'user', content: tooLong(bytes(line), cut), timestamp: Date.now() });
+      const cut = Buffer.from(line).subarray(0, NODE).toString('utf8').replace(/�$/, '');
+      prompt = `${request}\n\nYour line was:\n${line}\n\n${tooLong(bytes(line), cut)}`;
     }
     return tries.reduce((a, b) => bytes(a) <= bytes(b) ? a : b);
   };

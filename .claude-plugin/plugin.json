@@ -1,0 +1,13 @@
+{
+  "name": "optchat",
+  "version": "0.1.0",
+  "description": "OptChat memory for Claude Code: one endless chat per profile, remembered through a zoomable summary tree, with conversation imports. A port of pi-optchat.",
+  "author": { "name": "Jonas (pi-optchat); Claude Code port by Flo" },
+  "homepage": "https://github.com/florianclt/claude-optchat",
+  "repository": "https://github.com/florianclt/claude-optchat",
+  "license": "MIT",
+  "keywords": ["memory", "optchat", "profiles", "summaries"],
+  "mcpServers": {
+    "memory": { "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/dist/mcp.js"] }
+  }
+}
