@@ -6,7 +6,6 @@ import { homedir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
-import { getAgentDir, parseSkillBlock } from '@earendil-works/pi-coding-agent';
 import { record } from '../cache.ts';
 import { bytes, type Entry, type Kind, type Origin } from '../memory.ts';
 
@@ -18,6 +17,13 @@ export interface Conversation {
 }
 export interface Scan { conversations: Conversation[]; warnings: string[]; note?: string }
 const exec = promisify(execFile);
+/** Pi's agent directory, as Pi resolves it: PI_CODING_AGENT_DIR, else ~/.pi/agent. */
+const getAgentDir = () => process.env.PI_CODING_AGENT_DIR ? resolve(process.env.PI_CODING_AGENT_DIR.replace(/^~(?=$|[\\/])/, homedir())) : join(homedir(), '.pi/agent');
+/** Pi expands `/skill:name args` into `<skill name="…" location="…">body</skill>` followed by the args. */
+function parseSkillBlock(text: string): { name: string; userMessage?: string } | undefined {
+  const match = /^<skill name="([^"]+)" location="[^"]*">\n[\s\S]*?\n<\/skill>(?:\n\n([\s\S]+))?$/.exec(text);
+  return match ? { name: match[1], userMessage: match[2]?.trim() || undefined } : undefined;
+}
 const string = (v: unknown) => typeof v === 'string' ? v : undefined;
 const codexSubagent = (metadata: Record<string, unknown>) => metadata.source === 'subagent'
   || record(metadata.source) && 'subagent' in metadata.source;

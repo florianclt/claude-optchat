@@ -12,7 +12,6 @@ import { Memory, bytes, type Compressor } from '../src/memory.ts';
 import { localDay } from '../src/store.ts';
 import { scanLocal, scanChatGPT, scanClaudeMemories, readConversation, timestamp, type Conversation, type ImportedEntry } from '../src/import/sources.ts';
 import { prepareImport, runImport, memoryDirectory, pendingImport, discardImport, deduplicate, chronological } from '../src/import/job.ts';
-import { chooseImport, showProgress } from '../src/import/ui.ts';
 
 const date = '2026-01-02T12:00:00.000Z';
 const short: Compressor = async () => 'Historical decision summarized';
@@ -644,33 +643,6 @@ test('chronological rebuild keeps imported conversations and native turns togeth
   const first = entry('conversation', date), later = { ...entry('conversation', '2026-12-01T00:00:00.000Z'), receipt: 'import:second' };
   const native: ImportedEntry = { kind: 'user', text: 'native', date: '2026-06-01T00:00:00.000Z' };
   assert.deepEqual(chronological([native, first, later]).map(e => e.text), [first.text, later.text, native.text]);
-});
-
-test('a failed progress dialog cancels and joins its worker before returning', async () => {
-  const dir = temp(), old = new Memory(dir, short); await old.close();
-  try {
-    const job = prepareImport(dir, old, [entry('large', date, 'long '.repeat(200))], 'append'); assert.ok(job);
-    let stopped = false;
-    const ui = { select: async () => { throw new Error('UI closed'); }, input: async () => undefined,
-      confirm: async () => false, notify: () => {}, setWidget: () => {} };
-    await assert.rejects(showProgress({ ui }, job, async signal => {
-      await new Promise<void>(resolve => signal.addEventListener('abort', () => { stopped = true; resolve(); }, { once: true }));
-    }, new AbortController().signal), /UI closed/);
-    assert.equal(stopped, true);
-    assert.equal(memoryDirectory(dir), dir);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
-});
-
-test('preparation source dialog receives shutdown cancellation before staging any data', async () => {
-  const dir = temp(), memory = new Memory(dir, short), controller = new AbortController();
-  try {
-    const ui = { select: async (_title: string, _options: string[], opts?: { signal?: AbortSignal }) => {
-      assert.equal(opts?.signal, controller.signal);
-      return new Promise<undefined>(resolve => opts?.signal?.addEventListener('abort', () => resolve(undefined), { once: true }));
-    }, input: async () => undefined, confirm: async () => false, notify: () => {}, setWidget: () => {}, custom: async () => { throw new Error('unexpected picker'); } };
-    const task = chooseImport({ ui }, 'test', memory, 'fixture', controller.signal); controller.abort();
-    assert.equal(await task, undefined); assert.equal(pendingImport(dir), undefined);
-  } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('an imported message header names the source, the minute, 13 characters of the conversation id and the title, and the full id stays in the origin', async () => {

@@ -3,7 +3,6 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync,
 import { createConnection, createServer } from 'node:net';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import type { ModelChoice } from './compactor.ts';
 import { record } from './cache.ts';
 import { atomicWrite, type Store } from './store.ts';
 import { DEFAULT_SETTINGS, readSettings, type Settings } from './settings.ts';
@@ -11,6 +10,8 @@ import { DEFAULT_SETTINGS, readSettings, type Settings } from './settings.ts';
 export const isWindows = process.platform === 'win32';
 const PIPE_PREFIX = '\\\\.\\pipe\\';
 
+/** A model and effort for the compactor or subagents. `provider` is kept so Pi-era config.json files still load. */
+export interface ModelChoice { provider: string; model: string; thinking: typeof THINKING[number] }
 export const dataHome = () => resolve(process.env.OPTCHAT_HOME ?? join(homedir(), '.optchat'));
 export interface ProfileConfig extends Settings { compactor: ModelChoice; subagent: ModelChoice }
 export const defaults: ProfileConfig = {

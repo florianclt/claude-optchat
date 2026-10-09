@@ -9,3 +9,5 @@ const sandboxes = (['HOME', 'USERPROFILE', 'OPTCHAT_HOME', 'PI_CODING_AGENT_DIR'
   return dir;
 });
 process.on('exit', () => { for (const dir of sandboxes) rmSync(dir, { recursive: true, force: true }); });
+// Hooks and commands start the profile's worker; tests drive memory themselves.
+process.env.OPTCHAT_NO_WORKER = '1';

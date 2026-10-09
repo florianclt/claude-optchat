@@ -1,177 +1,181 @@
 import { createHash } from 'node:crypto';
-import type { AgentMessage } from '@earendil-works/pi-agent-core';
-import type { SessionEntry } from '@earendil-works/pi-coding-agent';
-import { getCurrentSystemMessage, type SystemMessage, type UserMessage } from '@earendil-works/pi-ai';
-import { CAP, cap, flat, isView, type Memory } from './memory.ts';
-import { AT_WORK } from './prompts.ts';
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, readdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { cap, CAP, type Kind } from './memory.ts';
 import { record } from './cache.ts';
-import { DEFAULT_SETTINGS } from './settings.ts';
-import { imageRef, isImage } from './images.ts';
+import { atomicWrite, isMime, type Store } from './store.ts';
+import type { Arrival } from './runtime.ts';
 
-export const RUN_BOUNDARY = 'optchat.run';
-/** Subagent traffic to the main agent: a custom message on screen, a plain user message to the model, `work` in memory. */
-export const REPORT_TYPE = 'optchat-report';
-export const REPORT_RECEIPT = 'report:';
-/** A report's receipt in memory: it marks the entry as `work` and keeps a restart from delivering the report twice. */
-export const reportReceipt = (text: string) => REPORT_RECEIPT + createHash('sha256').update(text).digest('hex');
+/** How a tool reads in memory: OptChat's own MCP tools by their bare names, so search skips logged zoom and search calls as in Pi. */
+export function toolName(name: string) {
+  const own = /^mcp__plugin_optchat_[^_]+(?:_[^_]+)*__(\w+)$/.exec(name);
+  return own ? own[1] : name;
+}
+const AGENT_TOOLS = new Set(['Agent', 'Task']);
+const string = (v: unknown) => typeof v === 'string' ? v : undefined;
 
-export function textContent(content: unknown, images = true): string {
+interface Image { data: string; mimeType: string }
+const hash = (data: string) => createHash('sha256').update(data).digest('hex').slice(0, 16);
+/** As in Pi: an image is named by a hash of its base64 data, and the message text names it as `[image <hash>]`. */
+export const imageRef = (image: Image) => `[image ${hash(image.data)}]`;
+function image(block: Record<string, unknown>): Image | undefined {
+  const source = block.source;
+  if (block.type !== 'image' || !record(source) || source.type !== 'base64' || typeof source.data !== 'string' || typeof source.media_type !== 'string') return undefined;
+  return { data: source.data, mimeType: source.media_type };
+}
+/** Pi shrank images with its own resizer before keeping them; this port keeps them as Claude Code received them, which
+ * Claude Code has already sized for the model. */
+export async function saveImage(store: Store, { data, mimeType }: Image) {
+  const name = hash(data);
+  if (!isMime(mimeType) || await store.image(name)) return;
+  await store.putImage(name, mimeType, Buffer.from(data, 'base64'));
+}
+const REF = /\[image ([0-9a-f]{16})\]/g;
+/** The kept images a text names, in order, each once, as MCP image content. */
+export async function loadImages(store: Store, text: string) {
+  const names = [...new Set(Array.from(text.matchAll(REF), match => match[1]))];
+  return (await Promise.all(names.map(name => store.image(name))))
+    .flatMap(kept => kept ? [{ type: 'image' as const, data: Buffer.from(kept.data).toString('base64'), mimeType: kept.mimeType }] : []);
+}
+
+function textOf(content: unknown, images: Image[] = []): string {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
   return content.map((part: unknown) => {
-    if (typeof part !== 'object' || part === null) return '';
-    if ('type' in part && part.type === 'text' && 'text' in part && typeof part.text === 'string') return part.text;
-    if (images && isImage(part)) return imageRef(part);
+    if (!record(part)) return '';
+    if (part.type === 'text' && typeof part.text === 'string') return part.text;
+    const kept = image(part);
+    if (kept) { images.push(kept); return imageRef(kept); }
     return '';
   }).filter(Boolean).join('\n');
 }
-/** What the user typed, as Pi's input event (and so the inbox) saw it: no image references, and without the
- * `[Image …]` notes Pi appends after the text when it resizes, converts or omits an attached image. */
-export function typedText(content: unknown) {
-  const text = textContent(content, false);
-  return { text, bare: text.replace(/\n\n\[Image[ :][^\n]*\](?:\n\[Image[ :][^\n]*\])*$/, '') };
-}
-/** Pi's convertToLlm sends every custom message to the model as a user message. A shown one is part of the chat, so it
- * becomes a user message here too; another extension's starts with "[customType] ", as the recipe marks background work, so
- * the compactor never takes it for the user's words. A hidden one (display false), such as context an extension injects
- * each turn, stays custom: the model still sees it, and memory and the replay leave it out. Reports reach the model and the
- * previous-exchange replay as user messages; memory logs them as `work`. */
-export function asUser(message: AgentMessage): AgentMessage {
-  if (message.role !== 'custom' || !message.display) return message;
-  const { content, customType, timestamp } = message;
-  if (customType === REPORT_TYPE) return { role: 'user', content, timestamp };
-  const tag = `[${customType}] `;
-  if (typeof content === 'string') return { role: 'user', content: tag + content, timestamp };
-  const [first, ...rest] = content;
-  if (first?.type === 'text') return { role: 'user', content: [{ ...first, text: tag + first.text }, ...rest], timestamp };
-  return { role: 'user', content: [{ type: 'text', text: tag.trimEnd() }, ...content], timestamp };
-}
-export function logMessage(memory: Memory, message: AgentMessage, receipt?: string) {
-  const date = new Date(message.timestamp).toISOString();
-  if (message.role === 'user') memory.append(receipt?.startsWith(REPORT_RECEIPT) ? 'work' : 'user', textContent(message.content), date, receipt);
-  else if (message.role === 'assistant') {
-    for (const block of message.content) {
-      if (block.type === 'text' && block.text.trim()) memory.append('talk', block.text, date);
-      if (block.type === 'toolCall') memory.append('tool', `${block.name} ${JSON.stringify(block.arguments)}`, date);
-    }
-    if (message.stopReason === 'error' || message.stopReason === 'aborted')
-      memory.append('echo', `Agent ${message.stopReason}: ${message.errorMessage ?? 'No further details'}`, date);
-  } else if (message.role === 'toolResult')
-    // A zoom's page already names the images it returns.
-    memory.append('echo', cap(`${message.toolName}: ${textContent(message.content, message.toolName !== 'zoom')}`), date);
-}
-export function boundedMessage(message: AgentMessage): AgentMessage {
-  if (message.role !== 'toolResult') return message;
-  const text = message.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
-  if (text.length <= CAP) return message;
-  return { ...message, content: [{ type: 'text', text: cap(text) }, ...message.content.filter(c => c.type === 'image')] };
-}
-/** The caller supplies a single settled run, including any steering after text-only replies. */
-function completedExchange(history: readonly AgentMessage[]) {
-  const last = history.findLastIndex(m => m.role === 'user' || m.role === 'assistant');
-  const answer = history[last];
-  if (answer?.role !== 'assistant' || answer.stopReason !== 'stop'
-    || answer.content.some(block => block.type === 'toolCall')) return [];
-  const content = answer.content.flatMap(block => block.type === 'text' ? [{ type: 'text' as const, text: block.text }] : []);
-  if (!content.some(block => block.text.trim())) return [];
-  const requests: UserMessage[] = [];
-  for (const message of history.slice(0, last)) {
-    if (message.role === 'user') requests.push({ ...message, content: textContent(message.content) });
-  }
-  if (!requests.length) return [];
-  return [...requests, { ...answer, content }];
+/** What the user typed, as Claude Code records it: slash commands as `/name args`, `!` commands as typed, and none of the
+ * output Claude Code logs for them. Undefined for text the user never typed. */
+export function typed(text: string): { kind: Kind; text: string } | undefined {
+  const tag = (name: string) => new RegExp(`<${name}>([\\s\\S]*?)</${name}>`).exec(text)?.[1]?.trim();
+  if (/^\s*<(local-command-stdout|local-command-stderr|local-command-caveat|bash-stdout|bash-stderr)>/.test(text)) return undefined;
+  const command = tag('command-name');
+  if (command !== undefined) return { kind: 'user', text: `${command.startsWith('/') ? command : `/${command}`} ${tag('command-args') ?? ''}`.trimEnd() };
+  const bash = tag('bash-input');
+  if (bash !== undefined) return { kind: 'user', text: `!${bash}` };
+  if (/^\s*<task-notification>/.test(text)) return { kind: 'work', text: text.trim() };
+  if (/^\[Request interrupted by user/.test(text)) return { kind: 'echo', text: 'Agent aborted: interrupted by the user' };
+  return text.trim() ? { kind: 'user', text } : undefined;
 }
 
-/** Default limit in bytes of text (16 KB, ~4,000 tokens). Most exchanges are 1-7 KB; a larger one, usually a big paste, is
- * left out entirely and the model falls back to its summaries in the memory view, zooming for the full text if it needs it. */
-export const PREVIOUS_EXCHANGE = DEFAULT_SETTINGS.previousExchangeKB * 1000;
+/** Where a session's transcript was read up to, and the names of recent tool calls, whose results arrive in later lines. */
+export interface Cursor { offset: number; tools: Record<string, string> }
+const KEPT_TOOLS = 200;
 
-/** The latest successful run on this branch, skipping failed and unfinished runs; none if it is over `limit` bytes. */
-export function previousExchange(branch: readonly SessionEntry[], limit = PREVIOUS_EXCHANGE) {
-  const exchange = latestExchange(branch);
-  const bytes = exchange.reduce((sum, message) => sum + Buffer.byteLength(textContent(message.content)), 0);
-  return bytes <= limit ? exchange : [];
-}
-
-function latestExchange(branch: readonly SessionEntry[]) {
-  let end = -1;
-  let legacyEnd = branch.length;
-  const messages = (entries: readonly SessionEntry[]) => entries.flatMap(entry => entry.type === 'message' ? [asUser(entry.message)] : entry.type === 'custom_message' ? [asUser({ role: 'custom', customType: entry.customType, content: entry.content, display: entry.display, timestamp: Date.parse(entry.timestamp) })] : []);
-  for (let i = branch.length - 1; i >= 0; i--) {
-    const entry = branch[i];
-    if (entry.type !== 'custom' || entry.customType !== RUN_BOUNDARY || !record(entry.data)) continue;
-    legacyEnd = i;
-    if (entry.data.state === 'end') end = i;
-    else if (entry.data.state === 'start') {
-      if (end >= 0) {
-        const exchange = completedExchange(messages(branch.slice(i + 1, end)));
-        if (exchange.length) return exchange;
-      }
-      end = -1;
+/** The entries in a Claude Code transcript from `cursor` on, for memory, as Pi's message_end logged them: the user's words
+ * (`user`), replies (`talk`), tool calls (`tool`), results capped at 30,000 characters (`echo`), and subagent reports
+ * (`work`). Reasoning, sidechains, injected context and compaction summaries are left out. Only whole lines are read. */
+export function readTranscript(path: string, cursor: Cursor = { offset: 0, tools: {} }) {
+  const entries: Arrival[] = [], images: Image[] = [];
+  if (!existsSync(path)) return { entries, images, cursor };
+  const fd = openSync(path, 'r');
+  let text: string;
+  try {
+    const size = fstatSync(fd).size;
+    if (size < cursor.offset) cursor = { offset: 0, tools: {} };
+    const buffer = Buffer.alloc(size - cursor.offset);
+    readSync(fd, buffer, 0, buffer.length, cursor.offset);
+    text = buffer.toString('utf8');
+  } finally { closeSync(fd); }
+  const end = text.lastIndexOf('\n') + 1, tools = { ...cursor.tools };
+  for (const line of text.slice(0, end).split('\n')) {
+    if (!line.trim()) continue;
+    let value: unknown;
+    try { value = JSON.parse(line); } catch { continue; }
+    if (!record(value) || value.isSidechain === true || value.isMeta === true || value.isCompactSummary === true || value.isVisibleInTranscriptOnly === true) continue;
+    const message = value.message, uuid = string(value.uuid), date = string(value.timestamp) ?? new Date().toISOString();
+    if (!record(message) || !uuid) continue;
+    const push = (k: number, kind: Kind, body: string) => { if (body.trim()) entries.push({ kind, text: body, date, receipt: `cc:${uuid}:${k}` }); };
+    if (value.type === 'assistant' && Array.isArray(message.content)) {
+      if (value.isApiErrorMessage === true) { push(0, 'echo', `Agent error: ${textOf(message.content) || 'No further details'}`); continue; }
+      message.content.forEach((block: unknown, k) => {
+        if (!record(block)) return;
+        if (block.type === 'text' && typeof block.text === 'string') push(k, 'talk', block.text);
+        if (block.type === 'tool_use' && typeof block.name === 'string') {
+          if (typeof block.id === 'string') tools[block.id] = block.name;
+          push(k, 'tool', `${toolName(block.name)} ${JSON.stringify(block.input ?? {})}`);
+        }
+      });
+    } else if (value.type === 'user') {
+      const content = message.content;
+      if (typeof content === 'string') { const t = typed(content); if (t) push(0, t.kind, t.text); continue; }
+      if (!Array.isArray(content)) continue;
+      const words: unknown[] = [];
+      content.forEach((block: unknown, k) => {
+        if (!record(block)) return;
+        if (block.type !== 'tool_result') { words.push(block); return; }
+        const id = string(block.tool_use_id) ?? '', name = tools[id] ?? 'tool', result = textOf(block.content, name === 'zoom' || name.endsWith('__zoom') ? [] : images);
+        const agent = record(value.toolUseResult) ? string(value.toolUseResult.agentId) : undefined;
+        if (AGENT_TOOLS.has(name) && agent && block.is_error !== true) push(k, 'work', `[${agent}] ${result}\n\nFull chat: zoom("${agent}")`);
+        else push(k, 'echo', cap(`${toolName(name)}: ${block.is_error === true ? '(error) ' : ''}${result}`, CAP));
+      });
+      if (words.length) { const t = typed(textOf(words, images)); if (t) push(content.length, t.kind, t.text); }
     }
   }
-  // Older sessions have no run markers. Recover a successful exchange best-effort;
-  // text-only steering boundaries cannot be reconstructed for those old runs.
-  const legacy = messages(branch.slice(0, legacyEnd));
-  let boundary = 0;
-  let latest: ReturnType<typeof completedExchange> = [];
-  for (let i = 0; i < legacy.length; i++) {
-    const message = legacy[i];
-    if (message.role !== 'assistant' || message.stopReason === 'toolUse') continue;
-    const exchange = completedExchange(legacy.slice(boundary, i + 1));
-    if (exchange.length) latest = exchange;
-    boundary = i + 1;
-  }
-  return latest;
+  const names = Object.entries(tools);
+  return { entries, images, cursor: { offset: cursor.offset + Buffer.byteLength(text.slice(0, end)), tools: Object.fromEntries(names.slice(-KEPT_TOOLS)) } };
 }
 
-/** Ends every subagent report, so the parent knows it can check the report against what the child did. */
-export const fullChat = (id: string) => `Full chat: zoom("${id}")`;
-export const withoutFullChat = (text: string) => text.replace(/\n\nFull chat: zoom\("[\w-]+"\)$/gm, '');
-const TASK = '\n</chat>\n\nYour task:\n';
-/** Tool calls and results in a run transcript keep their head and tail, so a page holds many steps. */
+/** Each session's cursor, in the profile, so a transcript is read once however many hooks run. */
+const cursorFile = (dir: string, session: string) => join(dir, 'sessions', `${session.replace(/[^\w-]/g, '_')}.json`);
+export function loadCursor(dir: string, session: string): Cursor {
+  try {
+    const value: unknown = JSON.parse(readFileSync(cursorFile(dir, session), 'utf8'));
+    if (record(value) && Number.isSafeInteger(value.offset) && record(value.tools)) return { offset: Number(value.offset), tools: value.tools as Record<string, string> };
+  } catch {}
+  return { offset: 0, tools: {} };
+}
+export const saveCursor = (dir: string, session: string, cursor: Cursor) => atomicWrite(cursorFile(dir, session), JSON.stringify(cursor));
+
+/** A subagent's chat for zoom("<agent id>"), as `kind|text` lines like Pi's run transcripts. Claude Code keeps it next to the
+ * session's transcript, in `<session>/subagents/agent-<id>.jsonl`. */
 const STEP = 1_000;
-/** A subagent's chat for zoom, as `kind|text` lines: its task without the memory view, replies, tool calls and results, and what it was told. */
-export function runTranscript(messages: readonly AgentMessage[]) {
-  const task = messages.find(message => message.role === 'user');
-  return messages.flatMap(message => {
-    if (message.role === 'user') {
-      // Only the task prompt holds the memory view (src/agents.ts): `${view}\n\nYour task:\n${task}`.
-      const text = textContent(message.content, false), at = text.indexOf(TASK);
-      return [`user|${message === task && isView(text) && at >= 0 ? text.slice(at + '\n</chat>\n\n'.length) : text}`];
+export function findAgentTranscript(id: string, root = join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'projects')) {
+  if (!/^[\w-]{1,64}$/.test(id)) return undefined;
+  const name = `agent-${id}.jsonl`;
+  try {
+    for (const project of readdirSync(root, { withFileTypes: true })) {
+      if (!project.isDirectory()) continue;
+      for (const session of readdirSync(join(root, project.name), { withFileTypes: true })) {
+        if (!session.isDirectory()) continue;
+        const file = join(root, project.name, session.name, 'subagents', name);
+        if (existsSync(file)) return file;
+      }
     }
-    if (message.role === 'toolResult') return [`echo|${cap(`${message.toolName}: ${textContent(message.content, false)}`, STEP)}`];
-    if (message.role !== 'assistant') return [];
-    return [...message.content.flatMap(block => block.type === 'text' && block.text.trim() ? [`talk|${block.text}`]
-      : block.type === 'toolCall' ? [`tool|${cap(`${block.name} ${JSON.stringify(block.arguments)}`, STEP)}`] : []),
-    ...message.stopReason === 'error' || message.stopReason === 'aborted' ? [`echo|Agent ${message.stopReason}: ${message.errorMessage ?? 'No further details'}`] : []];
-  }).join('\n');
+  } catch {}
+  return undefined;
 }
-
-/** The status line naming running agents by id and the first words of their task; none while nothing runs. */
-export function atWork(runs: readonly { id: string; task: string }[]) {
-  if (!runs.length) return undefined;
-  return AT_WORK + runs.map(({ id, task }) => {
-    const words = flat(task).replaceAll('"', "'").split(/\s+/).filter(Boolean), start = words.slice(0, 6).join(' ');
-    // Six words, but never more than 60 characters: a task can be one long word.
-    const preview = [...start].slice(0, 60).join('');
-    return `${id} "${preview}${words.length > 6 || preview.length < start.length ? '…' : ''}"`;
-  }).join(', ') + '.';
-}
-
-/** Keep one completed exchange plus the current run; all other history comes from the view.
- * `status` goes last, after everything cached, so it never moves the cached prefix (see cachePayload). It comes with new input only
- * (the user, a report, a restart note): a call that follows a tool result is the same turn, which already had it. */
-export function buildContext(canonical: AgentMessage[], run: AgentMessage[], view: string, prompt: string,
-  previous: readonly AgentMessage[] = [], status?: string): AgentMessage[] {
-  const system = getCurrentSystemMessage(canonical);
-  const head: SystemMessage = { role: 'system', content: prompt, toolsAdded: system?.toolsAdded, timestamp: 0 };
-  if (!run.some(m => m.role === 'user')) throw new Error('OptChat has no current user message; refusing to send historical context.');
-  let injected = false;
-  const messages = [...previous, ...run].filter(m => m.role !== 'system').map(message => {
-    if (message.role !== 'user' || injected) return message;
-    injected = true;
-    return { ...message, content: [{ type: 'text' as const, text: view }, ...(typeof message.content === 'string' ? [{ type: 'text' as const, text: message.content }] : message.content)] };
-  });
-  return [head, ...messages, ...status && messages.at(-1)?.role !== 'toolResult' ? [{ role: 'user' as const, content: [{ type: 'text' as const, text: status }], timestamp: 0 }] : []];
+export function agentTranscript(file: string) {
+  const lines: string[] = [], tools: Record<string, string> = {};
+  for (const line of readFileSync(file, 'utf8').split('\n')) {
+    let value: unknown;
+    try { value = JSON.parse(line); } catch { continue; }
+    if (!record(value) || !record(value.message) || value.isMeta === true) continue;
+    const content = value.message.content;
+    if (value.type === 'user') {
+      if (typeof content === 'string') { lines.push(`user|${content}`); continue; }
+      if (!Array.isArray(content)) continue;
+      for (const block of content) {
+        if (!record(block)) continue;
+        if (block.type === 'text' && typeof block.text === 'string') lines.push(`user|${block.text}`);
+        if (block.type === 'tool_result') lines.push(`echo|${cap(`${toolName(tools[string(block.tool_use_id) ?? ''] ?? 'tool')}: ${textOf(block.content)}`, STEP)}`);
+      }
+    } else if (value.type === 'assistant' && Array.isArray(content)) {
+      for (const block of content) {
+        if (!record(block)) continue;
+        if (block.type === 'text' && typeof block.text === 'string' && block.text.trim()) lines.push(`talk|${block.text}`);
+        if (block.type === 'tool_use' && typeof block.name === 'string') {
+          if (typeof block.id === 'string') tools[block.id] = block.name;
+          lines.push(`tool|${cap(`${toolName(block.name)} ${JSON.stringify(block.input ?? {})}`, STEP)}`);
+        }
+      }
+    }
+  }
+  return lines.join('\n');
 }

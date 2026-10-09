@@ -7,10 +7,6 @@ import { Memory, cap, CAP, start, end, bytes, mostDue, type Compression, type Pa
 import { appendJson, localDay } from '../src/store.ts';
 import { lockProfile } from '../src/profiles.ts';
 import { splitView, cachePayload } from '../src/cache.ts';
-import { logMessage, buildContext, boundedMessage } from '../src/transcript.ts';
-import { Inbox } from '../src/inbox.ts';
-import type { ToolResultMessage } from '@earendil-works/pi-ai';
-import type { AssistantMessage, SystemMessage, UserMessage } from '@earendil-works/pi-ai';
 
 test('tree covers all history, fits incrementally, and exact originals survive restart', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'optchat-test-'));
@@ -411,49 +407,6 @@ test('a view that cannot be saved only warns, since the log stays authoritative'
   } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('next turn excludes old conversation; current tool loop and reasoning remain verbatim', async () => {
-  const system: SystemMessage = { role: 'system', content: 'old system', timestamp: 0 };
-  const old: UserMessage = { role: 'user', content: 'OLD FULL CONVERSATION', timestamp: 1 };
-  const current: UserMessage = { role: 'user', content: 'new question', timestamp: 2 };
-  const assistant: AssistantMessage = { role: 'assistant', content: [{ type: 'thinking', thinking: 'private thoughts', thinkingSignature: 'signed' }, { type: 'text', text: 'visible reply' }],
-    api: 'anthropic-messages', provider: 'anthropic', model: 'fixture', stopReason: 'stop', timestamp: 3,
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
-  const projected = buildContext([system, old, current, assistant], [current, assistant], '<chat>\n0+1|old summary\n</chat>', 'new system');
-  assert.ok(!JSON.stringify(projected).includes('OLD FULL CONVERSATION'));
-  assert.equal(projected[2], assistant);
-  const dir = mkdtempSync(join(tmpdir(), 'optchat-test-')); const memory = new Memory(dir, async () => 'summary');
-  try { logMessage(memory, assistant); assert.equal(memory.root.length, 1); assert.equal(memory.root[0].text, 'visible reply'); }
-  finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
-});
-
-test('tool images survive active-context truncation while text is bounded', () => {
-  const image = { type: 'image' as const, mimeType: 'image/png', data: 'example-base64' };
-  const message: ToolResultMessage = { role: 'toolResult', toolCallId: 'read-1', toolName: 'read', isError: false, timestamp: 1,
-    content: [{ type: 'text', text: 'x'.repeat(40_000) }, image] };
-  const bounded = boundedMessage(message);
-  assert.equal(bounded.role, 'toolResult');
-  if (bounded.role !== 'toolResult') throw new Error('unexpected role');
-  assert.ok(bounded.content.includes(image));
-  assert.ok(bounded.content.filter(c => c.type === 'text').reduce((n, c) => n + c.text.length, 0) <= CAP);
-});
-
-test('crash recovery saves unconsumed inputs once, including append-before-ack crash', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'optchat-test-'));
-  const memory = new Memory(dir, async () => 'summary');
-  try {
-    let inbox = new Inbox(dir);
-    inbox.record('queued while the agent was working');
-    assert.equal(inbox.claim('unrelated extension message'), undefined);
-    const delivered = inbox.record('delivered, but crashed before the journal acknowledgment');
-    memory.append('user', 'delivered, but crashed before the journal acknowledgment', new Date().toISOString(), delivered);
-    inbox = new Inbox(dir);
-    assert.equal(inbox.recover(memory), 1);
-    assert.equal(memory.root.length, 2);
-    assert.equal(new Inbox(dir).recover(memory), 0);
-    assert.equal(memory.root.length, 2);
-  } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
-});
-
 test('incremental view size and pending count match the rendered view across failures and restart', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'optchat-size-'));
   let failures = 3;
@@ -578,20 +531,6 @@ test('a message whose node keeps failing is queued, so later messages never scan
     await idle();
     assert.ok(lookups < 100, `${lookups} tree lookups for one new message, with message 0 failing`);
   } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
-});
-
-test('an expanded /skill: command claims the input it came from, and only that one', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'optchat-inbox-'));
-  try {
-    const inbox = new Inbox(dir);
-    const plain = inbox.record('/skill:demox');
-    const skill = inbox.record('/skill:demox  go');
-    assert.equal(inbox.claimSkill('demo', 'go'), undefined, 'a skill name must match whole');
-    assert.equal(inbox.claimSkill('demox', 'other'), undefined, 'arguments must match');
-    assert.equal(inbox.claimSkill('demox', 'go'), skill);
-    assert.equal(inbox.claimSkill('demox', 'go'), undefined, 'an input is claimed once');
-    assert.equal(inbox.claimSkill('demox'), plain);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('rebuilding a leaf that a saved parent already hides does not inflate the view size', async () => {
